@@ -63,7 +63,8 @@ def draw_predictions(pil_img, results, conf_thresh=0.25):
             # draw box
             draw.rectangle([x1, y1, x2, y2], outline=(255,0,0), width=2)
             text = f"{label} {score:.2f}"
-            tw, th = draw.textsize(text, font=font)
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
             draw.rectangle([x1, y1-th, x1+tw, y1], fill=(255,0,0))
             draw.text((x1, y1-th), text, fill=(255,255,255), font=font)
     return pil_img, counts
