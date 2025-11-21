@@ -3,219 +3,253 @@ import streamlit as st
 from ultralytics import YOLO
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-import os
-import requests
 import io
+import os
 import time
-import base64
 from datetime import datetime
 
-# Mongo
+# MongoDB
 from pymongo import MongoClient, errors
+import gridfs
 
-# -------------------------
-# Config (edit if needed)
-# -------------------------
-MODEL_LOCAL_PATH = "best.onnx"   # put best.onnx beside app.py or set GDRIVE_FILE_ID
-GDRIVE_FILE_ID = ""              # optional: Google Drive file id to download model at startup
-MODEL_IMG_SIZE = 1024            # the image size you exported with
-DEFAULT_CONF = 0.25
+# ----------------- Config -----------------
+# If you put best.onnx inside repo, keep this as "best.onnx"
+MODEL_LOCAL_PATH = "best.onnx"
 
-DB_NAME = "microscopy_db"
-COLLECTION_NAME = "detections"
+# If you want to have a sample image pre-bundled in your environment,
+# here's the path from your session that was provided earlier:
+SAMPLE_IMAGE_PATH = "/mnt/data/fac1e28d-0cba-4b9a-9e2e-6da55e713604.png"
 
-# -------------------------
-# Helper: Get Mongo URI
-# -------------------------
-def get_mongo_uri():
-    # 1) try Streamlit secrets
-    try:
-        return st.secrets["mongo"]["uri"]
-    except Exception:
-        pass
-    # 2) try environment variable fallback
-    return os.environ.get("MONGO_URI", None)
+# Model image size (use same as exported)
+MODEL_IMG_SIZE = 1024
 
-# -------------------------
-# Download helper (optional)
-# -------------------------
-def download_from_gdrive(file_id, dest):
-    if os.path.exists(dest):
-        return dest
-    url = f"https://drive.google.com/uc?export=download&id={file_id}"
-    r = requests.get(url, stream=True)
-    if r.status_code != 200:
-        raise RuntimeError(f"Failed to download model from Drive: status {r.status_code}")
-    with open(dest, "wb") as f:
-        for chunk in r.iter_content(chunk_size=16384):
-            if chunk:
-                f.write(chunk)
-    return dest
+# ------------------------------------------
 
-# -------------------------
-# Streamlit UI config
-# -------------------------
-st.set_page_config(layout="wide", page_title="Microscopy ONNX Demo (with MongoDB)")
-st.title("Microscopy Detector — save detections to MongoDB Atlas")
+st.set_page_config(layout="wide", page_title="Microscopy Detector + MongoDB (GridFS)")
+st.title("Microscopy Detector — save detections to MongoDB (GridFS)")
 
-# Sidebar controls
-conf_slider = st.sidebar.slider("Confidence threshold", 0.0, 1.0, float(DEFAULT_CONF), 0.01)
-model_img_size = st.sidebar.number_input("Model input size (imgsz)", value=int(MODEL_IMG_SIZE), step=1)
-show_raw_doc = st.sidebar.checkbox("Show stored document preview after save", value=True)
+# ----------------- MongoDB Connection Helper -----------------
+@st.cache_resource
+def get_mongo_client(uri):
+    # return MongoClient or raise
+    return MongoClient(uri, serverSelectionTimeoutMS=5000)
 
-# -------------------------
-# Load model (cached)
-# -------------------------
+def get_db_and_fs(client, db_name="microscopy_db"):
+    db = client[db_name]
+    fs = gridfs.GridFS(db)
+    coll = db["detections"]
+    return db, fs, coll
+
+# ----------------- Load model -----------------
 @st.cache_resource
 def load_model(path):
-    model = YOLO(path)
-    return model
+    return YOLO(path)  # this will accept .onnx exported by Ultralytics
 
-# download model if GDrive id provided
-if GDRIVE_FILE_ID:
-    try:
-        st.info("Downloading model from Google Drive...")
-        download_from_gdrive(GDRIVE_FILE_ID, MODEL_LOCAL_PATH)
-        st.success("Downloaded model.")
-    except Exception as e:
-        st.error(f"Failed to download model: {e}")
-
-# attempt to load model
-with st.spinner("Loading model..."):
-    try:
-        model = load_model(MODEL_LOCAL_PATH)
-        st.success("Model loaded.")
-    except Exception as e:
-        st.error(f"Failed to load model '{MODEL_LOCAL_PATH}': {e}")
-        st.stop()
-
-# -------------------------
-# Drawing & postprocessing
-# -------------------------
+# ----------------- Draw & postprocess helper -----------------
 def draw_predictions(pil_img, results, conf_thresh=0.25):
-    """
-    Draw detections on PIL image and return (pil_out, counts_dict).
-    Uses ultralytics Results objects.
-    """
     draw = ImageDraw.Draw(pil_img)
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", 16)
     except Exception:
         font = ImageFont.load_default()
+
     counts = {}
-    for r in results:  # r is Results for each image (we pass single image)
-        boxes = getattr(r, "boxes", None)
+    for r in results:
+        boxes = r.boxes
         if boxes is None:
             continue
-        # boxes: a Boxes object; iterate
         for box in boxes:
-            # robust attribute access for different ultralytics versions
-            score = float(box.conf[0]) if hasattr(box, "conf") else float(getattr(box, "confidence", 0.0))
-            cls = int(box.cls[0]) if hasattr(box, "cls") else int(getattr(box, "cls", 0))
+            # ultralytics Boxes object metadata access
+            # support both .conf/.cls arrays and older attributes
+            try:
+                score = float(box.conf[0])
+            except Exception:
+                score = float(getattr(box, "confidence", 0.0))
+            try:
+                cls = int(box.cls[0])
+            except Exception:
+                cls = int(getattr(box, "cls", 0))
             if score < conf_thresh:
                 continue
-            xyxy = box.xyxy[0].tolist() if hasattr(box, "xyxy") else None
-            if xyxy is None:
-                continue
-            x1, y1, x2, y2 = xyxy
-            label = model.names[cls] if (hasattr(model, "names") and cls < len(model.names)) else str(cls)
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            label = model.names[cls] if cls < len(model.names) else str(cls)
             counts[label] = counts.get(label, 0) + 1
-            # draw box and label background
-            draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=2)
-            text = f"{label} {score:.2f}"
-            try:
-                bbox = draw.textbbox((0, 0), text, font=font)
-                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            except Exception:
-                tw, th = draw.textsize(text, font=font)
-            draw.rectangle([x1, y1 - th, x1 + tw, y1], fill=(255, 0, 0))
-            draw.text((x1, y1 - th), text, fill=(255, 255, 255), font=font)
+
+            # draw box + label
+            bbox = draw.textbbox((0,0), f"{label} {score:.2f}", font=font)
+            tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+            draw.rectangle([x1, y1, x2, y2], outline=(255,0,0), width=2)
+            draw.rectangle([x1, y1-th, x1+tw, y1], fill=(255,0,0))
+            draw.text((x1, y1-th), f"{label} {score:.2f}", fill=(255,255,255), font=font)
+
     return pil_img, counts
 
-# -------------------------
-# MongoDB connection (lazy)
-# -------------------------
-mongo_uri = get_mongo_uri()
-mongo_client = None
-mongo_connected = False
-if mongo_uri:
-    try:
-        mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        # quick ping to test connection / auth
-        mongo_client.admin.command('ping')
-        mongo_connected = True
-    except errors.PyMongoError as e:
-        st.warning(f"MongoDB connection failed: {e}. You can still run inference but saving will be disabled.")
-        mongo_connected = False
+# ----------------- UI: Mongo URI (supports st.secrets or manual entry) -----------------
+st.sidebar.header("Database (MongoDB Atlas)")
+
+mongo_uri = None
+secret_present = False
+try:
+    # prefer secrets if available
+    mongo_uri = st.secrets["mongo"]["uri"]
+    secret_present = True
+except Exception:
+    secret_present = False
+
+if secret_present:
+    st.sidebar.success("Mongo URI loaded from Streamlit secrets.")
+    # show a masked display
+    st.sidebar.text("Using Mongo URI from secrets.")
 else:
-    st.info("No MongoDB URI found in Streamlit secrets or MONGO_URI env var. Saving disabled until you set it.")
+    st.sidebar.info("Enter your MongoDB Atlas connection string (mongodb+srv://...)")
+    mongo_uri = st.sidebar.text_input("MongoDB URI", value="", placeholder="mongodb+srv://<user>:<pass>@cluster0....")
+    if not mongo_uri:
+        st.sidebar.warning("No Mongo URI provided. DB features disabled until you enter URI.")
 
-# prepare DB/collection if connected
-if mongo_connected:
-    db = mongo_client[DB_NAME]
-    collection = db[COLLECTION_NAME]
+use_db = bool(mongo_uri and mongo_uri.strip() != "")
 
-# -------------------------
-# Image upload / camera
-# -------------------------
-uploaded = st.file_uploader("Upload microscope image", type=["png", "jpg", "jpeg", "tif", "tiff"])
-camera = st.camera_input("Or take a picture (Chromium browsers)")
-
-if uploaded is None and camera is None:
-    st.info("Upload an image or use the camera to run detection.")
+# ----------------- Load model -----------------
+try:
+    with st.spinner("Loading model..."):
+        model = load_model(MODEL_LOCAL_PATH)
+    st.sidebar.success("Model loaded.")
+except Exception as e:
+    st.sidebar.error(f"Failed loading model: {e}")
     st.stop()
 
-img_bytes = uploaded.read() if uploaded else camera.read()
-orig_pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-st.image(orig_pil, caption="Input image", width=420)
+# ----------------- Main UI -----------------
+st.write("Upload an image or use the sample image to run detection and store results in MongoDB (GridFS).")
+col1, col2 = st.columns([1, 1])
 
-# Button: run inference
-if st.button("Run inference"):
-    start = time.time()
-    # predict - pass numpy array
-    results = model.predict(source=np.array(orig_pil), imgsz=int(model_img_size), conf=float(conf_slider), verbose=False)
-    pil_out, counts = draw_predictions(orig_pil.copy(), results, conf_thresh=float(conf_slider))
-    st.image(pil_out, caption="Detections", use_column_width=True)
-    st.write("Detected counts:", counts)
-    st.success(f"Inference done in {time.time() - start:.2f}s")
+with col1:
+    uploaded = st.file_uploader("Upload microscope image", type=["png","jpg","jpeg","tif","tiff"])
+    use_sample = st.checkbox("Use sample image", value= False)
+    if use_sample:
+        if os.path.exists(SAMPLE_IMAGE_PATH):
+            uploaded = open(SAMPLE_IMAGE_PATH, "rb")
+        else:
+            st.warning("Sample image not found at SAMPLE_IMAGE_PATH.")
+    conf_thresh = st.slider("Confidence threshold", 0.0, 1.0, 0.25)
+    run_btn = st.button("Run inference & save to DB" if use_db else "Run inference (DB disabled)")
 
-    # Convert images to Base64
-    def pil_to_base64_str(image: Image.Image, fmt="PNG") -> str:
-        buf = io.BytesIO()
-        image.save(buf, format=fmt)
-        b = base64.b64encode(buf.getvalue()).decode("utf-8")
-        return b
+with col2:
+    st.header("Recent DB entries")
+    show_last_n = st.number_input("Show last N entries", min_value=1, max_value=20, value=5)
+    refresh_db = st.button("Refresh list")
 
-    orig_b64 = pil_to_base64_str(orig_pil, fmt="PNG")
-    detected_b64 = pil_to_base64_str(pil_out, fmt="PNG")
+# ----------------- Connect to DB if requested -----------------
+client = None; db = None; fs = None; collection = None
+if use_db:
+    try:
+        client = get_mongo_client(mongo_uri)
+        # test server selection
+        client.admin.command('ping')
+        db, fs, collection = get_db_and_fs(client)
+        st.sidebar.success("Connected to MongoDB Atlas.")
+    except errors.ServerSelectionTimeoutError as e:
+        st.sidebar.error("Could not connect to MongoDB Atlas. Check URI/network. " + str(e))
+        use_db = False
+    except Exception as e:
+        st.sidebar.error("Mongo connection error: " + str(e))
+        use_db = False
 
-    # Prepare document
-    document = {
-        "timestamp": datetime.utcnow(),
-        "counts": counts,
-        "original_image_base64": orig_b64,
-        "detected_image_base64": detected_b64,
-        "model": MODEL_LOCAL_PATH,
-        "img_size": int(model_img_size)
-    }
-
-    # If mongo not connected, inform user and skip saving
-    if not mongo_connected:
-        st.warning("MongoDB not configured or connection failed. To enable saving: add your Atlas URI to Streamlit secrets or set env var MONGO_URI.")
+# ----------------- Run inference flow -----------------
+if run_btn:
+    if uploaded is None:
+        st.warning("Please upload an image or choose the sample image.")
     else:
-        # Show a button to confirm saving (avoid accidental writes)
-        if st.button("Save this detection to DB"):
+        # read image bytes
+        if isinstance(uploaded, io.IOBase):
+            # file object (sample)
+            img_bytes = uploaded.read()
+        elif hasattr(uploaded, "read"):
+            img_bytes = uploaded.read()
+        else:
+            # in case open() gave a path
             try:
-                insertion_result = collection.insert_one(document)
-                st.success(f"Saved to DB. Document id: {insertion_result.inserted_id}")
-                if show_raw_doc:
-                    st.write("Stored document preview (truncated fields):")
-                    preview = document.copy()
-                    # Avoid dumping full huge base64 to UI - show trimmed lengths instead
-                    preview["original_image_base64"] = f"<base64 {len(orig_b64)} chars>"
-                    preview["detected_image_base64"] = f"<base64 {len(detected_b64)} chars>"
-                    st.json(preview)
-            except errors.OperationFailure as e:
-                st.error(f"MongoDB operation failed: {e}")
+                img_bytes = open(uploaded, "rb").read()
+            except Exception:
+                st.error("Failed to read uploaded/sample image.")
+                img_bytes = None
+
+        if img_bytes:
+            pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            st.image(pil_img, caption="Input image", width=400)
+
+            # run inference
+            t0 = time.time()
+            try:
+                results = model.predict(source=np.array(pil_img), imgsz=MODEL_IMG_SIZE, conf=conf_thresh, verbose=False)
             except Exception as e:
-                st.error(f"Failed to insert document: {e}")
+                st.error(f"Inference failed: {e}")
+                results = []
+            t1 = time.time()
+
+            pil_out, counts = draw_predictions(pil_img.copy(), results, conf_thresh=conf_thresh)
+            st.image(pil_out, caption="Detections", width=400)
+            st.write("Counts:", counts)
+            st.write(f"Inference time: {t1-t0:.2f}s")
+
+            # convert output image to bytes (PNG)
+            buf = io.BytesIO()
+            pil_out.save(buf, format="PNG")
+            buf.seek(0)
+            image_bytes = buf.getvalue()
+
+            # ----------------- Save to MongoDB (GridFS + metadata) -----------------
+            if use_db and collection is not None and fs is not None:
+                try:
+                    ts = datetime.utcnow()
+                    # store binary image in GridFS
+                    file_id = fs.put(image_bytes,
+                                     filename=f"detection_{ts.isoformat()}.png",
+                                     contentType="image/png",
+                                     metadata={"timestamp": ts, "model": os.path.basename(MODEL_LOCAL_PATH), "img_size": MODEL_IMG_SIZE})
+
+                    # metadata document
+                    doc = {
+                        "timestamp": ts,
+                        "gridfs_id": file_id,
+                        "counts": counts,
+                        "model": os.path.basename(MODEL_LOCAL_PATH),
+                        "img_size": MODEL_IMG_SIZE
+                    }
+                    insertion_result = collection.insert_one(doc)
+                    st.success(f"Saved detection to DB. doc_id={insertion_result.inserted_id}, gridfs_id={file_id}")
+                except Exception as e:
+                    st.error(f"Failed to save to MongoDB: {e}")
+            else:
+                if not use_db:
+                    st.info("DB not configured — image not saved. To enable, provide a valid MongoDB URI in the sidebar.")
+
+# ----------------- Show last N entries (GridFS retrieval) -----------------
+def show_last_entries(n=5):
+    if not use_db or collection is None or fs is None:
+        st.info("DB not configured or connection failed.")
+        return
+
+    try:
+        docs = list(collection.find().sort("timestamp", -1).limit(n))
+        if not docs:
+            st.info("No entries found in DB.")
+            return
+        for d in docs:
+            st.markdown("---")
+            st.write(f"Document ID: {d.get('_id')}")
+            st.write(f"Timestamp (UTC): {d.get('timestamp')}")
+            st.write("Counts:", d.get("counts", {}))
+            gridfs_id = d.get("gridfs_id")
+            try:
+                file_bytes = fs.get(gridfs_id).read()
+                st.image(Image.open(io.BytesIO(file_bytes)), width=400)
+            except Exception as e:
+                st.error(f"Could not read GridFS file {gridfs_id}: {e}")
+    except Exception as e:
+        st.error("Error reading DB entries: " + str(e))
+
+if refresh_db:
+    show_last_entries(show_last_n)
+
+# show by default at page load (when DB configured)
+if use_db and not refresh_db:
+    show_last_entries(show_last_n)
