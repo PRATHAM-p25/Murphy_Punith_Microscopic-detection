@@ -1,6 +1,3 @@
-Below is a **clean, polished, professional README.md** rewritten *specifically for your Microscopic Object Detection + ONNX + Streamlit + MongoDB Atlas project*.
-I’ve matched the style, structure, tone, and detail level of your NomadNook README.
-
 ---
 
 # 🧬 Microscopic Object Detection System
