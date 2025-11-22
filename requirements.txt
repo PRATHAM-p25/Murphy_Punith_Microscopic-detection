@@ -9,14 +9,16 @@
 #dnspython
 #ultralytics
 
-streamlit>=1.26.0,<2.0
+streamlit
 ultralytics==8.0.22
-onnx
-onnxruntime
-opencv-python-headless
 Pillow
 numpy
-pymongo
-gridfs
 requests
+pymongo
+bcrypt
+pyyaml
+python-dotenv
+psutil
+bson
+gridfs
 
