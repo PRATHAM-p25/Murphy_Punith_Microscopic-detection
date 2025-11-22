@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 from ultralytics import YOLO
 from PIL import Image, ImageDraw, ImageFont
@@ -9,6 +8,7 @@ from pymongo import MongoClient, errors
 import gridfs
 from datetime import datetime
 import bcrypt
+from bson.objectid import ObjectId
 
 # -----------------------
 # Config
@@ -27,20 +27,26 @@ DEFAULT_CONF = 0.25
 def get_mongo_uri():
     # Prefer Streamlit secrets, fallback to env var
     try:
+        # Check for st.secrets existence and structure
         mongo_conf = st.secrets.get("mongo")
         if mongo_conf and "uri" in mongo_conf:
             return mongo_conf["uri"]
     except Exception:
+        # st.secrets might not be defined or accessible
         pass
+    # Fallback to environment variable
     return os.environ.get("MONGO_URI")
 
 MONGO_URI = get_mongo_uri()
 USE_DB = bool(MONGO_URI)
 
 def hash_password(plain_password: str) -> bytes:
+    """Hashes a plain text password using bcrypt."""
+    # The stored password needs to be checked against the salt + hash
     return bcrypt.hashpw(plain_password.encode("utf-8"), bcrypt.gensalt())
 
 def check_password(plain_password: str, hashed: bytes) -> bool:
+    """Checks a plain text password against the stored bcrypt hash."""
     try:
         return bcrypt.checkpw(plain_password.encode("utf-8"), hashed)
     except Exception:
@@ -50,8 +56,10 @@ def check_password(plain_password: str, hashed: bytes) -> bool:
 # Download model helper
 # -----------------------
 def download_from_gdrive(file_id, dest):
+    """Downloads a file from Google Drive."""
     if os.path.exists(dest):
         return dest
+    # Basic download link for public files
     url = f"https://drive.google.com/uc?export=download&id={file_id}"
     r = requests.get(url, stream=True)
     r.raise_for_status()
@@ -66,50 +74,60 @@ def download_from_gdrive(file_id, dest):
 # -----------------------
 @st.cache_resource
 def load_model(model_path):
+    """Loads the YOLO model (cached)."""
     return YOLO(model_path)
 
 # -----------------------
 # Text size utility (robust across environments)
 # -----------------------
 def get_text_size(draw, text, font):
+    """Calculates text dimensions robustly across Pillow versions."""
     try:
+        # Use textbbox (modern Pillow)
         bbox = draw.textbbox((0,0), text, font=font)
         w = bbox[2] - bbox[0]; h = bbox[3] - bbox[1]
         return w, h
     except Exception:
+        # Fallback for older versions (textsize is deprecated)
         try:
             return draw.textsize(text, font=font)
         except Exception:
-            try:
-                return font.getsize(text)
-            except Exception:
-                return (len(text)*6, 11)
+            # Final fallback, non-accurate estimation
+            return (len(text) * 6, 11)
 
 # -----------------------
 # Draw detections
 # -----------------------
 def draw_predictions(pil_img, results, conf_thresh=0.25, model_names=None):
+    """Draws bounding boxes and labels on the image."""
     draw = ImageDraw.Draw(pil_img)
     try:
+        # Attempt to load a common font
         font = ImageFont.truetype("DejaVuSans.ttf", 16)
     except Exception:
+        # Fallback to default font
         font = ImageFont.load_default()
+        
     counts = {}
+    
+    # Iterate through all detection results
     for r in results:
         boxes = getattr(r, "boxes", None)
         if boxes is None:
             continue
+            
+        # Iterate through individual detected bounding boxes
         for box in boxes:
-            try:
-                score = float(box.conf[0]) if hasattr(box, "conf") else float(box.confidence)
-            except Exception:
-                score = float(getattr(box, "confidence", 0.0))
-            try:
-                cls = int(box.cls[0]) if hasattr(box, "cls") else int(box.cls)
-            except Exception:
-                cls = int(getattr(box, "class_id", 0))
+            # Robustly get confidence score
+            score = float(box.conf[0]) if hasattr(box, "conf") else float(getattr(box, "confidence", 0.0))
+            
+            # Robustly get class ID
+            cls = int(box.cls[0]) if hasattr(box, "cls") else int(getattr(box, "class_id", 0))
+            
             if score < conf_thresh:
                 continue
+                
+            # Robustly get bounding box coordinates (x1, y1, x2, y2)
             try:
                 xyxy = box.xyxy[0].tolist()
                 x1, y1, x2, y2 = xyxy
@@ -119,14 +137,21 @@ def draw_predictions(pil_img, results, conf_thresh=0.25, model_names=None):
                     x1, y1, x2, y2 = coords[0].tolist()
                 else:
                     continue
+                    
             label = (model_names[cls] if model_names and cls < len(model_names) else str(cls))
             counts[label] = counts.get(label, 0) + 1
+            
+            # Draw bounding box
             draw.rectangle([x1, y1, x2, y2], outline=(255,0,0), width=2)
+            
+            # Draw label background and text
             text = f"{label} {score:.2f}"
             tw, th = get_text_size(draw, text, font)
-            ty1 = max(0, y1 - th)
+            # Position label box slightly above the bounding box
+            ty1 = max(0, y1 - th) 
             draw.rectangle([x1, ty1, x1 + tw, y1], fill=(255,0,0))
             draw.text((x1, ty1), text, fill=(255,255,255), font=font)
+            
     return pil_img, counts
 
 # -----------------------
@@ -138,17 +163,22 @@ fs = None
 collection = None
 users_col = None
 db_error_msg = None
+
 if USE_DB:
     try:
+        # Connect to MongoDB
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        client.server_info()  # triggers connection / auth
+        client.server_info()  # Triggers connection/auth check
+        
+        # Select database and collections
         db = client["microscopy_db"]
         fs = gridfs.GridFS(db)
         collection = db["detections"]
         users_col = db["users"]
-    except errors.OperationFailure as e:
+        
+    except errors.OperationFailure:
         db_error_msg = ("MongoDB auth failure. Check username/password and user privileges.")
-    except errors.ServerSelectionTimeoutError as e:
+    except errors.ServerSelectionTimeoutError:
         db_error_msg = ("Could not connect to MongoDB Atlas. Check Network Access / IP whitelist.")
     except Exception as e:
         db_error_msg = f"MongoDB connection error: {e}"
@@ -159,30 +189,51 @@ if USE_DB:
 st.markdown("<h1 style='text-align:left'>Microscopy Detector (ONNX via Ultralytics + MongoDB)</h1>", unsafe_allow_html=True)
 st.write("---")
 
-# Initialize session state
+# Initialize session state for user and for the current auth view
 if "user" not in st.session_state:
-    st.session_state.user = None  # will store {'username':..., '_id':...}
+    st.session_state.user = None  # Stores {'username':..., '_id':...}
+if "auth_view" not in st.session_state:
+    st.session_state.auth_view = "Sign In" # Default view is Sign In
 
+# --- Authentication Column ---
 col_auth_left, col_auth_right = st.columns([1,1])
 with col_auth_left:
     st.subheader("Authentication")
-    # Show either logged in user or forms
+    
     if st.session_state.user:
-        st.success(f"Signed in as: {st.session_state.user.get('username')}")
-        if st.button("Logout"):
+        # User is logged in: show success and Logout button
+        st.success(f"Signed in as: **{st.session_state.user.get('username')}**")
+        if st.button("Logout", key="logout_btn", use_container_width=True):
             st.session_state.user = None
+            st.session_state.auth_view = "Sign In" # Reset view on logout
             st.experimental_rerun()
+            
     else:
-        # Two buttons that open either sign-in or sign-up form
-        auth_choice = st.radio("Choose action", ("Sign In", "Sign Up"))
+        # User is NOT logged in: show Sign In / Sign Up buttons
+        col_btn_in, col_btn_up = st.columns(2)
+        
+        with col_btn_in:
+            # Highlight current active view
+            style_in = "primary" if st.session_state.auth_view == "Sign In" else "secondary"
+            if st.button("Sign In", key="show_signin_btn", type=style_in, use_container_width=True):
+                st.session_state.auth_view = "Sign In"
+        with col_btn_up:
+            style_up = "primary" if st.session_state.auth_view == "Sign Up" else "secondary"
+            if st.button("Sign Up", key="show_signup_btn", type=style_up, use_container_width=True):
+                st.session_state.auth_view = "Sign Up"
 
-        if auth_choice == "Sign Up":
+        st.markdown("---") # Visual separator between buttons and form
+        
+        # --- Display Sign Up Form ---
+        if st.session_state.auth_view == "Sign Up":
+            st.info("Create a new account.")
             with st.form("signup_form"):
                 su_username = st.text_input("Username", key="su_username")
-                su_email = st.text_input("Email", key="su_email")
+                su_email = st.text_input("Email (Optional)", key="su_email")
                 su_password = st.text_input("Password", type="password", key="su_password")
                 su_password2 = st.text_input("Confirm password", type="password", key="su_password2")
                 submitted = st.form_submit_button("Create account")
+                
                 if submitted:
                     if not USE_DB:
                         st.error("MongoDB URI not configured. Add to Streamlit secrets or env var.")
@@ -203,20 +254,25 @@ with col_auth_left:
                                 user_doc = {
                                     "username": su_username,
                                     "email": su_email,
-                                    "password": hashed,   # bytes
+                                    "password": hashed,    # bytes
                                     "created_at": datetime.utcnow()
                                 }
                                 try:
-                                    res = users_col.insert_one(user_doc)
-                                    st.success("Account created. You can now sign in.")
+                                    users_col.insert_one(user_doc)
+                                    st.success("Account created. You can now **Sign In**.")
+                                    st.session_state.auth_view = "Sign In" # Switch view after successful sign up
+                                    # st.experimental_rerun() # Rerunning here would clear the success message. Better to rely on the form submit flow.
                                 except Exception as e:
                                     st.error(f"Failed to create account: {e}")
 
-        else:  # Sign In
+        # --- Display Sign In Form ---
+        elif st.session_state.auth_view == "Sign In":
+            st.info("Sign in to save your detections.")
             with st.form("signin_form"):
                 si_username = st.text_input("Username or Email", key="si_username")
                 si_password = st.text_input("Password", type="password", key="si_password")
                 submitted = st.form_submit_button("Sign in")
+                
                 if submitted:
                     if not USE_DB:
                         st.error("MongoDB URI not configured. Add to Streamlit secrets or env var.")
@@ -234,19 +290,21 @@ with col_auth_left:
                                 if isinstance(stored_pw, (bytes, bytearray)):
                                     good = check_password(si_password, stored_pw)
                                 else:
-                                    # if it's a python dict or object, convert
+                                    # Try converting from BSON Binary type if necessary
                                     try:
-                                        # bson.binary.Binary -> bytes
                                         good = check_password(si_password, bytes(stored_pw))
                                     except Exception:
                                         good = False
+                                        
                                 if good:
-                                    st.session_state.user = {"username": user.get("username"), "_id": user.get("_id")}
+                                    # Store essential user data in session state
+                                    st.session_state.user = {"username": user.get("username"), "_id": str(user.get("_id"))}
                                     st.success(f"Signed in: {user.get('username')}")
                                     st.experimental_rerun()
                                 else:
                                     st.error("Incorrect password.")
 
+# --- Model & DB Status Column ---
 with col_auth_right:
     st.subheader("Model & DB status")
     model_status = "Loaded" if os.path.exists(MODEL_LOCAL_PATH) else "Not found locally"
@@ -265,10 +323,11 @@ st.write("---")
 # Load model; allow auto-download if Drive ID present
 # -----------------------
 if GDRIVE_FILE_ID:
-    try:
-        download_from_gdrive(GDRIVE_FILE_ID, MODEL_LOCAL_PATH)
-    except Exception as e:
-        st.error(f"Failed to download model from Drive: {e}")
+    with st.spinner(f"Checking / Downloading model from Drive (ID: {GDRIVE_FILE_ID})..."):
+        try:
+            download_from_gdrive(GDRIVE_FILE_ID, MODEL_LOCAL_PATH)
+        except Exception as e:
+            st.error(f"Failed to download model from Drive: {e}")
 
 with st.spinner("Loading model..."):
     try:
@@ -290,22 +349,28 @@ with col1:
     camera = st.camera_input("Or take a picture (Chromium browsers)")
 
     if uploaded is None and camera is None:
-        st.info("Upload an image or use the camera.")
+        st.info("Upload an image or use the camera to start.")
     else:
+        # Read the image bytes
         img_bytes = uploaded.read() if uploaded else camera.read()
+        # Open and convert to RGB (YOLO prefers this)
         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         st.image(pil_img, caption="Input image", width=400)
 
-        if st.button("Run inference"):
+        if st.button("Run inference", use_container_width=True, type="primary"):
             start = time.time()
-            try:
-                results = model.predict(source=np.array(pil_img), imgsz=MODEL_IMG_SIZE, conf=conf, verbose=False)
-            except Exception as e:
-                st.error(f"Model inference failed: {e}")
-                st.stop()
+            with st.spinner("Processing image and running YOLO model..."):
+                try:
+                    # Run detection
+                    results = model.predict(source=np.array(pil_img), imgsz=MODEL_IMG_SIZE, conf=conf, verbose=False)
+                except Exception as e:
+                    st.error(f"Model inference failed: {e}")
+                    st.stop()
 
-            pil_out, counts = draw_predictions(pil_img.copy(), results, conf_thresh=conf, model_names=model_names)
-            st.image(pil_out, caption="Detections", use_column_width=True)
+                # Draw predictions and get counts
+                pil_out, counts = draw_predictions(pil_img.copy(), results, conf_thresh=conf, model_names=model_names)
+            
+            st.image(pil_out, caption="Detections (Saved to DB if signed in)", use_column_width=True)
             st.write("Counts:", counts)
             st.success(f"Inference done in {time.time()-start:.2f}s")
 
@@ -318,35 +383,56 @@ with col1:
                 st.info("Sign in to save this detection to the DB.")
             else:
                 try:
-                    # Save image bytes to GridFS
+                    # 1. Save processed image bytes to GridFS
                     buf = io.BytesIO()
-                    pil_out.save(buf, format="PNG")
+                    # Using JPEG for potentially smaller file size, though PNG is fine too
+                    pil_out.save(buf, format="JPEG", quality=90) 
                     img_bytes_out = buf.getvalue()
-                    file_id = fs.put(img_bytes_out, filename=f"det_{int(time.time())}.png", contentType="image/png")
+                    file_id = fs.put(
+                        img_bytes_out, 
+                        filename=f"det_{st.session_state.user.get('username')}_{int(time.time())}.jpg", 
+                        contentType="image/jpeg",
+                        user_id=st.session_state.user.get("_id") # Optional metadata
+                    )
 
+                    # 2. Save detection metadata to 'detections' collection
                     document = {
                         "timestamp": datetime.utcnow(),
                         "counts": counts,
+                        "conf_threshold": conf,
                         "model": MODEL_LOCAL_PATH,
                         "img_gridfs_id": file_id,
-                        "user": st.session_state.user.get("username")
+                        "user_id": ObjectId(st.session_state.user.get("_id")), # Store as ObjectId
+                        "username": st.session_state.user.get("username")
                     }
                     insertion_result = collection.insert_one(document)
-                    st.success(f"Saved detection to DB. doc_id: {insertion_result.inserted_id}")
+                    st.success(f"Saved detection to DB! Document ID: {insertion_result.inserted_id}")
                 except Exception as e:
                     st.error(f"Failed to save to DB: {e}")
 
 with col2:
     st.header("Instructions / Quick help")
     st.markdown("""
-    - Use **Sign Up** to create an account (stored in MongoDB with a hashed password).  
-    - Use **Sign In** to sign in and enable saving detections.  
-    - If using Streamlit Cloud, add your MongoDB URI in *Manage app → Settings → Secrets* as:
-      ```
-      [mongo]
-      uri = "mongodb+srv://<username>:<password>@cluster0.dkc9xzx.mongodb.net/?retryWrites=true&w=majority"
-      ```
-    - Or set `MONGO_URI` as an environment variable.
-    """)
+    This application combines a microscopic object detection model (YOLO ONNX) with user authentication and data persistence using MongoDB Atlas.
 
-# end of app.py
+    - Use the **Sign Up** tab to create an account. Passwords are securely hashed with **bcrypt** before storage.
+    - Use the **Sign In** tab to log in. Once logged in, every detection you run will be saved in your history in MongoDB.
+    
+    ### MongoDB Configuration:
+    
+    If using Streamlit Cloud, add your MongoDB URI in *Manage app → Settings → Secrets* as:
+    
+    ```
+    # .streamlit/secrets.toml
+    [mongo]
+    uri = "mongodb+srv://<username>:<password>@cluster0.dkc9xzx.mongodb.net/?retryWrites=true&w=majority"
+    ```
+    
+    Alternatively, set the `MONGO_URI` as an environment variable.
+    """)
+    
+    # Show the current user object for debugging/reference
+    st.subheader("Session State")
+    st.json(st.session_state.user if st.session_state.user else {"user": "None (Logged Out)"})
+
+# st.write("---") # Removed a duplicate separator
